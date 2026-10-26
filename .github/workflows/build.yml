@@ -1,0 +1,105 @@
+name: Build APK (universal)
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Preparar proyecto
+        shell: bash
+        run: |
+          ZIP=""
+          BEST=-1
+          for z in $(find . -maxdepth 3 -iname '*.zip' -not -path './proj/*' -not -path './.git/*'); do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)
+            t=${t:-0}
+            if [ "$t" -ge "$BEST" ]; then
+              BEST=$t
+              ZIP=$z
+            fi
+          done
+          rm -rf proj
+          mkdir proj
+          if [ -n "$ZIP" ]; then
+            echo "Usando ZIP: $ZIP"
+            unzip -q -o "$ZIP" -d proj
+          else
+            echo "No hay ZIP; uso los archivos del repositorio"
+            tar --exclude=./proj --exclude=./.git -cf - . | tar -xf - -C proj
+          fi
+          SET=$(find proj -name 'settings.gradle*' -not -path '*/__MACOSX/*' | awk '{print length, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$SET" ]; then
+            echo "No encontre settings.gradle dentro del proyecto"
+            exit 1
+          fi
+          echo "ROOT=$(dirname "$SET")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Aceptar licencias del SDK
+        shell: bash
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar APK
+        shell: bash
+        run: |
+          cd "$ROOT"
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Reunir APK
+        shell: bash
+        run: |
+          APK=$(find "$ROOT" -name '*.apk' -path '*debug*' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "No se genero ningun APK"
+            exit 1
+          fi
+          mkdir -p out
+          cp "$APK" out/Jarvis.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-APK
+          path: out/Jarvis.apk
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: reportes-de-error
+          path: proj/**/build/reports/**
+          if-no-files-found: ignore
+
+      - name: Publicar en Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/Jarvis.apk --title "Jarvis #${{ github.run_number }}" --notes "APK generado automaticamente." || true
